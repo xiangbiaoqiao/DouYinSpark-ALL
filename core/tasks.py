@@ -16,11 +16,65 @@ groupMatchMode = config.get("groupMatchMode", "name")
 
 _SCROLL_CONTAINER_JS = """
 () => {
-    const el = document.querySelector('[class*="semi-list"]') ||
-               document.querySelector('#sub-app ul');
-    if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 10) {
-        el.scrollTop += 600; return true;
+    const grids = document.querySelectorAll('.ReactVirtualized__Grid');
+    let el = null;
+    for (const g of grids) {
+        if (g.scrollHeight <= g.clientHeight) continue;
+        if (!g.querySelector('[class*="item-header-name-"]')) continue;
+        if (!el || g.scrollHeight > el.scrollHeight) el = g;
     }
+    if (!el) el = document.querySelector('[class*="semi-list"]') ||
+                   document.querySelector('#sub-app ul');
+    if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 10) {
+        el.scrollTop += 800; return true;
+    }
+    return false;
+}
+"""
+
+_GRID_TOP_JS = """
+() => {
+    let el = null;
+    document.querySelectorAll('.ReactVirtualized__Grid').forEach(g => {
+        if (g.scrollHeight > g.clientHeight &&
+            g.querySelector('[class*="item-header-name-"]') &&
+            (!el || g.scrollHeight > el.scrollHeight)) el = g;
+    });
+    if (el) el.scrollTop = 0;
+}
+"""
+
+# 在虚拟列表中定位目标并点击（不要求视觉完全可见，点击后由调用方确认聊天框是否打开）
+_FIND_AND_CLICK_JS = """
+(arg) => {
+    const nick = arg.nick, exact = arg.exact;
+    let grid = null;
+    document.querySelectorAll('.ReactVirtualized__Grid').forEach(g => {
+        if (g.scrollHeight > g.clientHeight &&
+            g.querySelector('[class*="item-header-name-"]') &&
+            (!grid || g.scrollHeight > grid.scrollHeight)) grid = g;
+    });
+    if (!grid) return 'no-grid';
+    const gr = grid.getBoundingClientRect();
+    let best = null, bestDist = Infinity, count = 0;
+    document.querySelectorAll('[class*="item-header-name-"]').forEach(s => {
+        const hit = exact ? s.textContent === nick : s.textContent.indexOf(nick) >= 0;
+        if (!hit || s.offsetParent === null) return;
+        count++;
+        const r = s.getBoundingClientRect();
+        const dist = Math.max(0, gr.top - r.bottom, r.top - gr.bottom);
+        if (dist < bestDist) { bestDist = dist; best = s; }
+    });
+    if (!best) return 'not-in-dom';
+    best.click();
+    return 'clicked:' + count + ':' + Math.round(bestDist);
+}
+"""
+
+_CHAT_OPENED_JS = """
+() => {
+    const el = document.querySelector('[class*="chat-input-"]');
+    return !!el && el.offsetParent !== null;
 }
 """
 
@@ -101,58 +155,21 @@ def try_click_and_send(page, target, mapping, logger):
 
     nickname = info["nickname"]
 
-    # 边滚边找可见元素
-    page.evaluate("""
-    () => {
-        const el = document.querySelector('[class*="semi-list"]') ||
-                   document.querySelector('#sub-app ul');
-        if (el) el.scrollTop = 0;
-    }
-    """)
+    # 边滚边定位，点击后确认聊天框打开（规避虚拟列表渲染时序问题）
+    page.evaluate(_GRID_TOP_JS)
     time.sleep(0.3)
 
     clicked = False
-    for _ in range(80):
-        # 检查目标是否可见
-        visible = page.evaluate(f"""
-        () => {{
-            const spans = document.querySelectorAll('[class*="item-header-name-"]');
-            for (const s of spans) {{
-                if (s.textContent === {json.dumps(nickname, ensure_ascii=False)} &&
-                    s.offsetParent !== null) {{
-                    const r = s.getBoundingClientRect();
-                    return r.top >= 0 && r.bottom <= window.innerHeight;
-                }}
-            }}
-            return false;
-        }}
-        """)
-        if visible:
-            # 找到了，用坐标点击（绕过 Playwright 可见性检查）
-            page.evaluate(f"""
-            () => {{
-                const spans = document.querySelectorAll('[class*="item-header-name-"]');
-                for (const s of spans) {{
-                    if (s.textContent === {json.dumps(nickname, ensure_ascii=False)}) {{
-                        const r = s.getBoundingClientRect();
-                        s.click();
-                        return;
-                    }}
-                }}
-            }}
-            """)
-            clicked = True
-            break
+    for _ in range(150):
+        res = page.evaluate(_FIND_AND_CLICK_JS, {"nick": nickname, "exact": True})
+        if isinstance(res, str) and res.startswith("clicked"):
+            time.sleep(2)
+            if page.evaluate(_CHAT_OPENED_JS):
+                clicked = True
+                break
 
-        page.evaluate("""
-        () => {
-            const el = document.querySelector('[class*="semi-list"]') ||
-                       document.querySelector('#sub-app ul');
-            if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 10)
-                el.scrollTop += 300;
-        }
-        """)
-        time.sleep(0.2)
+        page.evaluate(_SCROLL_CONTAINER_JS)
+        time.sleep(0.3)
 
     if not clicked:
         logger.warning(f"未找到可见的 {nickname}")
@@ -239,48 +256,20 @@ def do_group_task(signer, username, groups):
 def _send_to_group(page, target, logger):
     """在群列表中找到目标群，点击并发送消息"""
     # 滚回顶部
-    page.evaluate("""
-    () => {
-        const el = document.querySelector('[class*="semi-list"]') ||
-                   document.querySelector('#sub-app ul');
-        if (el) el.scrollTop = 0;
-    }
-    """)
+    page.evaluate(_GRID_TOP_JS)
     time.sleep(0.3)
 
     clicked = False
-    for _ in range(80):
-        # 找目标群（名称包含匹配）
-        found = page.evaluate("""
-        (target) => {
-            const spans = document.querySelectorAll('[class*="item-header-name-"]');
-            for (const s of spans) {
-                if (s.textContent.indexOf(target) >= 0 &&
-                    s.offsetParent !== null) {
-                    const r = s.getBoundingClientRect();
-                    if (r.top >= 0 && r.bottom <= window.innerHeight) {
-                        s.click();
-                        return s.textContent;
-                    }
-                }
-            }
-            return null;
-        }
-        """, target)
+    for _ in range(150):
+        res = page.evaluate(_FIND_AND_CLICK_JS, {"nick": target, "exact": False})
+        if isinstance(res, str) and res.startswith("clicked"):
+            time.sleep(2)
+            if page.evaluate(_CHAT_OPENED_JS):
+                clicked = True
+                break
 
-        if found:
-            clicked = True
-            break
-
-        page.evaluate("""
-        () => {
-            const el = document.querySelector('[class*="semi-list"]') ||
-                       document.querySelector('#sub-app ul');
-            if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 10)
-                el.scrollTop += 300;
-        }
-        """)
-        time.sleep(0.2)
+        page.evaluate(_SCROLL_CONTAINER_JS)
+        time.sleep(0.3)
 
     if not clicked:
         logger.warning(f"未找到群聊: {target}")
